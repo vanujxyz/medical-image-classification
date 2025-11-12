@@ -1,92 +1,119 @@
 import streamlit as st
-import tensorflow as tf
 import numpy as np
-import cv2
+import tensorflow as tf
 from tensorflow.keras.models import load_model
 from PIL import Image
-import tempfile
-import matplotlib.pyplot as plt
+import cv2
+import time
 
-# ==============================================================
-# Load model
-# ==============================================================
+# ==============================
+# PAGE SETUP
+# ==============================
+st.set_page_config(page_title="Chest X-Ray Classifier", page_icon="🩻", layout="centered")
+
+st.title("🧠 Chest X-Ray Pneumonia Classifier")
+st.markdown("""
+Upload a chest X-ray image and the model will predict whether it shows **Pneumonia** or **Normal** lungs.  
+*(Using Baseline CNN with Fast Occlusion Visualization)*
+""")
+
+# ==============================
+# LOAD MODEL
+# ==============================
+MODEL_PATH = "models/baseline_cnn.h5"
+
 @st.cache_resource
-def load_trained_model():
-    model_path = r"C:\Users\vgang\medical-image-classification\models\efficientnet_b0_finetuned.keras"
-    model = load_model(model_path)
-    return model
+def load_cnn_model():
+    return load_model(MODEL_PATH)
 
-model = load_trained_model()
+try:
+    model = load_cnn_model()
+    st.success("✅ Baseline CNN model loaded successfully!")
+except Exception as e:
+    st.error(f"❌ Error loading model: {e}")
+    st.stop()
 
-# ==============================================================
-# Occlusion sensitivity function
-# ==============================================================
-def occlusion_map(image_array, model, patch_size=32, stride=16):
-    img_h, img_w = image_array.shape[:2]
-    arr = image_array / 255.0
-    inp = np.expand_dims(arr, axis=0).astype(np.float32)
-    base_pred = float(model.predict(inp, verbose=0)[0][0])
-    h_steps = (img_h - patch_size) // stride + 1
-    w_steps = (img_w - patch_size) // stride + 1
-    heatmap = np.zeros((h_steps, w_steps), dtype=np.float32)
-
-    for i in range(h_steps):
-        row_imgs = []
-        positions = []
-        for j in range(w_steps):
-            y, x = i * stride, j * stride
-            occluded = arr.copy()
-            occluded[y:y+patch_size, x:x+patch_size, :] = np.mean(arr, axis=(0,1))
-            row_imgs.append(occluded)
-            positions.append((i,j))
-        batch = np.stack(row_imgs, axis=0)
-        preds = model.predict(batch, verbose=0).squeeze()
-        effects = base_pred - preds
-        for (i_pos, j_pos), eff in zip(positions, effects):
-            heatmap[i_pos, j_pos] = eff
-
-    heatmap = cv2.resize(heatmap, (img_w, img_h))
-    heatmap = np.maximum(heatmap, 0)
-    if heatmap.max() > 0:
-        heatmap /= heatmap.max()
-    heatmap_uint8 = np.uint8(255 * heatmap)
-    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
-    overlay = cv2.addWeighted(cv2.cvtColor((arr*255).astype(np.uint8), cv2.COLOR_RGB2BGR), 
-                              0.7, heatmap_color, 0.3, 0)
-    overlay = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
-    return base_pred, overlay
-
-# ==============================================================
-# Streamlit UI
-# ==============================================================
-st.set_page_config(page_title="Pneumonia Detection App", page_icon="🩻", layout="wide")
-
-st.title("🩺 Pneumonia Detection from Chest X-rays")
-st.write("Upload a chest X-ray image and see the model's prediction with an explainability heatmap.")
-
-uploaded_file = st.file_uploader("Upload a chest X-ray image (JPG or PNG)", type=["jpg", "jpeg", "png"])
+# ==============================
+# IMAGE UPLOAD
+# ==============================
+uploaded_file = st.file_uploader("Upload a Chest X-ray Image", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
-    # Save temporary file
-    temp_file = tempfile.NamedTemporaryFile(delete=False)
-    temp_file.write(uploaded_file.read())
+    img = Image.open(uploaded_file).convert("RGB")
+    st.image(img, caption="🩻 Uploaded X-ray", use_container_width=True)
 
-    # Load image
-    image = Image.open(temp_file.name).convert("RGB")
-    image = image.resize((224, 224))
-    image_array = np.array(image)
+    # preprocess
+    img_resized = img.resize((224, 224))
+    img_array = np.array(img_resized) / 255.0
+    img_array = np.expand_dims(img_array, axis=0)
 
-    st.image(image, caption="Uploaded X-ray", use_column_width=False, width=300)
+    st.write("🔍 Running diagnosis...")
+    prediction = model.predict(img_array, verbose=0)[0][0]
 
-    with st.spinner("Analyzing X-ray... please wait ⏳"):
-        pred_score, overlay = occlusion_map(image_array, model)
-        label = "PNEUMONIA" if pred_score > 0.5 else "NORMAL"
-        confidence = pred_score if pred_score > 0.5 else 1 - pred_score
+    label = "PNEUMONIA" if prediction > 0.5 else "NORMAL"
+    confidence = float(prediction if prediction > 0.5 else 1 - prediction) * 100
 
-    st.success(f"**Prediction: {label}** (confidence: {confidence:.2%})")
+    if label == "PNEUMONIA":
+        st.error(f"🦠 **Prediction:** {label}  \n**Confidence:** {confidence:.2f}%")
+    else:
+        st.success(f"💨 **Prediction:** {label}  \n**Confidence:** {confidence:.2f}%")
 
-    st.subheader("Explainability Heatmap")
-    st.image(overlay, caption="Occlusion Sensitivity Map", use_column_width=True)
+    # ==============================
+    # FAST OCCLUSION MAP
+    # ==============================
+    with st.expander("Show Occlusion Sensitivity Map (Explainability)"):
+        st.write("🧠 Computing fast occlusion map (~5 seconds)...")
 
-st.markdown("---")
-st.markdown("Developed by **Vanuj Gangrade ,Agathian ganesan,Ardra Haridas,Joshua Varkey** | AI Medical Imaging Project 🧠")
+        def fast_occlusion_sensitivity(model, image, patch_size=25, stride=25):
+            """Fast occlusion map with coarse grid and smooth interpolation."""
+            h, w, _ = image.shape
+            grid_h = (h - patch_size) // stride + 1
+            grid_w = (w - patch_size) // stride + 1
+
+            heatmap = np.zeros((grid_h, grid_w))
+            base_pred = model.predict(image[np.newaxis, ...])[0][0]
+
+            total = grid_h * grid_w
+            progress = st.progress(0)
+            k = 0
+
+            for i in range(grid_h):
+                for j in range(grid_w):
+                    img_copy = np.array(image, copy=True)
+                    y, x = i * stride, j * stride
+                    img_copy[y:y+patch_size, x:x+patch_size, :] = 0
+                    new_pred = model.predict(img_copy[np.newaxis, ...])[0][0]
+                    heatmap[i, j] = abs(base_pred - new_pred)
+
+                    k += 1
+                    progress.progress(k / total)
+
+            heatmap = cv2.resize(heatmap, (224, 224))
+            heatmap = cv2.GaussianBlur(heatmap, (17, 17), 0)
+            heatmap = (heatmap - np.min(heatmap)) / (np.max(heatmap) + 1e-8)
+            return heatmap
+
+        img_norm = np.array(img_resized) / 255.0
+        start = time.time()
+        heatmap = fast_occlusion_sensitivity(model, img_norm)
+        end = time.time()
+
+        st.caption(f"✅ Done in {end - start:.1f} seconds")
+
+        overlay = cv2.applyColorMap(np.uint8(255 * heatmap), cv2.COLORMAP_JET)
+        overlay = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+        blended = cv2.addWeighted(np.array(img_resized), 0.7, overlay, 0.3, 0)
+
+        st.image(blended, caption="✨ Smooth Occlusion Sensitivity Map", use_container_width=True)
+
+else:
+    st.info("👆 Upload an image to start the prediction.")
+
+# ==============================
+# FOOTER
+# ==============================
+st.markdown("""
+---
+**Developed by:** Vanuj Gangrade  
+🧠 *Medical Image Classification using Baseline CNN + Occlusion Visualization*
+""")
